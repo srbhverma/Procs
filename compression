@@ -1,0 +1,140 @@
+if object_id( N'tempdb..#index_stats' ) is not null
+drop table #index_stats;
+select
+SN.name as Schema_Name,
+T.name as Table_Name,
+OS.partition_number AS Partition,
+OS.index_id AS Index_ID,
+I.name AS Index_Name,
+I.type_desc AS Index_Type,
+( OS.leaf_update_count * 100.0 / (OS.range_scan_count +
+OS.leaf_insert_count + OS.leaf_delete_count + OS.leaf_update_count +
+OS.leaf_page_merge_count + OS.singleton_lookup_count ) ) AS Percent_Update,
+( OS.range_scan_count * 100.0 / (OS.range_scan_count + OS.leaf_insert_count
++ OS.leaf_delete_count + OS.leaf_update_count + OS.leaf_page_merge_count +
+OS.singleton_lookup_count ) ) AS Percent_Scan
+into
+#index_stats
+from
+sys.dm_db_index_operational_stats( db_id(), null, null, null ) as OS
+inner join sys.tables as T on OS.object_id = T.object_id
+inner join sys.indexes as I on I.object_id = OS.object_id and
+OS.index_id = I.index_id
+outer apply( select name from sys.schemas where schema_id =
+T.schema_id ) as SN
+where
+(OS.range_scan_count + OS.leaf_insert_count + OS.leaf_delete_count +
+OS.leaf_update_count + OS.leaf_page_merge_count + OS.singleton_lookup_count) <> 0
+and
+objectproperty( I.object_id, 'IsUserTable' ) = 1;
+if object_id( 'tempdb..#row_compression_results' ) is not null
+drop table #row_compression_results;
+
+create table #row_compression_results
+(
+object_name sysname,
+schema_name sysname,
+index_id int,
+partition_number int,
+size_with_current_compression_setting_KB bigint,
+size_with_requested_compression_setting_KB bigint,
+sample_size_with_current_compression_setting_KB bigint,
+sample_size_with_requested_compression_setting_KB bigint
+);
+if object_id( 'tempdb..#page_compression_results' ) is not null
+drop table #page_compression_results;
+create table #page_compression_results
+(
+object_name sysname,
+schema_name sysname,
+index_id int,
+partition_number int,
+size_with_current_compression_setting_KB bigint,
+size_with_requested_compression_setting_KB bigint,
+sample_size_with_current_compression_setting_KB bigint,
+sample_size_with_requested_compression_setting_KB bigint
+);
+declare @currSchema as sysname;
+declare @currTable as sysname;
+declare dbCursor cursor fast_forward for
+select distinct
+SCHEMA_NAME,
+table_name
+from
+#index_stats
+order by
+Schema_Name,
+Table_Name;
+open dbCursor;
+fetch next from dbCursor into @currSchema, @currTable;
+while @@FETCH_STATUS = 0
+begin
+insert into #row_compression_results
+exec sp_estimate_data_compression_savings
+@schema_name = @currSchema,
+@object_name = @currTable,
+@index_id = null,
+@partition_number = null,
+@data_compression = 'ROW';
+insert into #page_compression_results
+exec sp_estimate_data_compression_savings
+@schema_name = @currSchema,
+@object_name = @currTable,
+@index_id = null,
+@partition_number = null,
+@data_compression = 'PAGE';
+
+fetch next from dbCursor into @currSchema, @currTable;
+end;
+close dbCursor;
+deallocate dbCursor;
+
+
+
+
+WITH  Table1 (Schema_name , Table_Name, Index_Name, Index_Type,Percent_Update, Percent_Scan,Current_Compression_Size_GB,Row_Compression_Size_GB,Page_Compression_Size_GB, Page_Compression_Savings_Percentage,ROW_Compression_Savings_Percentage) 
+ 
+AS ( 									
+select									
+IXS.Schema_Name,
+IXS.Table_Name,						
+IXS.Index_Name, 
+IXS.Index_Type,
+IXS.Percent_Update,
+IXS.Percent_Scan,
+PCR.size_with_current_compression_setting_KB /1024/1024 as
+Current_Compression_Size_GB,
+RCR.size_with_requested_compression_setting_KB /1024/1024 as
+Row_Compression_Size_GB,
+PCR.size_with_requested_compression_setting_KB /1024/1024 as
+Page_Compression_Size_GB,
+100 - cast( ( cast( PCR.size_with_requested_compression_setting_KB as
+numeric( 18, 6 ) ) / cast( PCR.size_with_current_compression_setting_KB as
+numeric( 18, 6 ) ) ) * 100 as numeric( 5, 2 ) ) as
+Page_Compression_Savings_Percentage,
+100 - cast( ( cast( RCR.size_with_requested_compression_setting_KB as
+numeric( 18, 6 ) ) / cast( RCR.size_with_current_compression_setting_KB as
+numeric( 18, 6 ) ) ) * 100 as numeric( 5, 2 ) ) as
+Row_Compression_Savings_Percentage
+from
+#index_stats as IXS
+left join #row_compression_results as RCR on IXS.schema_name =
+RCR.schema_name COLLATE DATABASE_DEFAULT and IXS.table_name = RCR.object_name COLLATE DATABASE_DEFAULT and IXS.index_ID =
+RCR.index_id 
+left join #page_compression_results as PCR on IXS.schema_name =
+PCR.schema_name COLLATE DATABASE_DEFAULT and IXS.table_name = PCR.object_name COLLATE DATABASE_DEFAULT and IXS.index_ID =
+PCR.index_id 
+where 
+PCR.size_with_current_compression_setting_KB /1024/1024 > 1 
+
+) 
+
+
+SELECT 'ALTER INDEX '+ QUOTENAME(Index_Name) + ' ON ' + QUOTENAME(Schema_name) + '.' + QUOTENAME(Table_Name) + ' REBUILD WITH (ONLINE = OFF , DATA_COMPRESSION=' + CASE WHEN ((Percent_Scan - Percent_Update) between 0 AND 100)  then 'PAGE'
+     WHEN ((( Percent_Update - Percent_Scan) between 0 AND 100) AND ((Page_Compression_Savings_Percentage-Row_Compression_Savings_Percentage) Between 0 AND 80 ) )  then 'ROW'
+	 ELSE 'PAGE' 
+	 END+ ');'
+from Table1 
+where (Page_Compression_Savings_Percentage > 20.0  )
+AND Index_Type <> 'HEAP' 
+order by Row_Compression_Size_GB
